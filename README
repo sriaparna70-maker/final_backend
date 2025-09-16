@@ -1,0 +1,33 @@
+Render → New Web Service → connect repo
+
+Root Directory: (leave blank if app.py is at repo root; set to "backend" if inside /backend)
+
+Build Command:
+pip install -r requirements.txt && python -c "import app; app._maybe_init()"
+
+Start Command:
+gunicorn -w 2 -b 0.0.0.0:$PORT app:app
+
+Environment:
+FRONTEND_ORIGIN = https://www.sreesasthapowersolutions.com
+# or
+ALLOWED_ORIGINS = https://www.sreesasthapowersolutions.com, https://sriaparna70-maker.github.io
+
+ZOHO_EMAIL = sivaramanganesan@zohomail.in
+ZOHO_APP_PASSWORD = <your 16-char Zoho app password>
+ZOHO_TO_EMAIL = sivaramanganesan@zohomail.in
+ZOHO_SMTP_HOST = smtp.zoho.in
+ZOHO_SMTP_PORT = 465
+
+# Optional (attach a Disk and set for persistence)
+# DATA_DIR = /data
+
+Health:
+GET /api/health  -> {"ok": true, ...}
+
+Forms:
+POST /api/contact    -> {name, email, message}
+POST /api/openaccess -> {name, email, phone, sanctioned_load, monthly_kwh, callback?, eb_bill?}
+
+eb_bill (optional):
+{"filename":"bill.pdf","content_type":"application/pdf","b64":"<base64-data>"}
