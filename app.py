@@ -1,219 +1,185 @@
-import os, re, csv, ssl, smtplib, sqlite3, threading, base64
-from datetime import datetime
+import os, re, sqlite3, csv, ssl, smtplib, json, threading
 from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from datetime import datetime
 
-# ---------- Writable storage (Render’s code dir is read-only) ----------
-DATA_DIR = os.environ.get("DATA_DIR", "/var/tmp/sree_sastha_data")
-os.makedirs(DATA_DIR, exist_ok=True)  # Mount a Render Disk & set DATA_DIR=/data if you want persistence
-DB_PATH  = os.path.join(DATA_DIR, "leads.db")
-CSV_PATH = os.path.join(DATA_DIR, "leads.csv")
-# ----------------------------------------------------------------------
+APP_VER = "2025-09-15"
 
-EMAIL_REGEX = re.compile(r"^[^@]+@[^@]+\.[^@]+$")
+DB_PATH  = os.path.join(os.path.dirname(__file__), "leads.db")
+CSV_PATH = os.path.join(os.path.dirname(__file__), "leads.csv")
+
 app = Flask(__name__)
 
-# ---------- CORS ----------
-def _get_allowed_origins():
-    ao = os.environ.get("ALLOWED_ORIGINS", "").strip()
-    if ao:
-        return [o.strip() for o in ao.split(",") if o.strip()]
-    fo = os.environ.get("FRONTEND_ORIGIN", "").strip()
-    return [fo] if fo else ["*"]
+# CORS: allow your site; while testing you can keep "*"
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "*")
+CORS(app, resources={r"/api/*": {"origins": FRONTEND_ORIGIN}})
 
-ALLOWED = _get_allowed_origins()
-CORS(app,
-     resources={r"/api/*": {"origins": ALLOWED}},
-     methods=["GET","POST","OPTIONS"],
-     allow_headers=["Content-Type","Authorization"])
-# --------------------------
+EMAIL_REGEX = re.compile(r"^[^@]+@[^@]+\.[^@]+$")
 
-# ---------- DB helpers ----------
-def _init_db():
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            cur = con.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS leads (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    topic TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    email TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-            """)
-            con.commit()
-        if not os.path.exists(CSV_PATH):
-            with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(["id","topic","name","email","message","created_at"])
-    except Exception as e:
-        app.logger.error(f"[DB init] {e}")
+# ---------- SQLite helpers ----------
+_db_lock = threading.Lock()
 
-def _save_lead(topic, name, email, message):
+def _connect():
+    # timeout helps avoid 'database is locked'; WAL reduces writer blocking
+    con = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    return con
+
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    with _connect() as con:
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic TEXT,
+            name TEXT,
+            email TEXT,
+            phone TEXT,
+            company TEXT,
+            sanctioned_load TEXT,
+            monthly_kwh TEXT,
+            message TEXT,
+            created_at TEXT
+        )
+        """)
+    if not os.path.exists(CSV_PATH):
+        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(
+                ["id","topic","name","email","phone","company",
+                 "sanctioned_load","monthly_kwh","message","created_at"]
+            )
+
+def save_lead(**kw):
     now = datetime.utcnow().isoformat(timespec="seconds")+"Z"
-    lead_id = None
-    try:
-        with sqlite3.connect(DB_PATH) as con:
+    fields = ("topic","name","email","phone","company","sanctioned_load","monthly_kwh","message")
+    row = [kw.get(k,"") for k in fields]
+    with _db_lock:
+        with _connect() as con:
             cur = con.cursor()
-            cur.execute("INSERT INTO leads (topic,name,email,message,created_at) VALUES (?,?,?,?,?)",
-                        (topic, name, email, message, now))
+            cur.execute(
+                "INSERT INTO leads (topic,name,email,phone,company,sanctioned_load,monthly_kwh,message,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (*row, now)
+            )
             lead_id = cur.lastrowid
-            con.commit()
-    except Exception as e:
-        app.logger.error(f"[DB insert] {e}")
-    try:
         with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([lead_id or "", topic, name, email, message, now])
-    except Exception as e:
-        app.logger.error(f"[CSV append] {e}")
+            csv.writer(f).writerow([lead_id, *row, now])
     return lead_id, now
-# -------------------------------
 
-# ---------- Email (Zoho SMTP) ----------
-def _send_email_sync(subject: str, body: str, reply_to: str = "", attachments: list = None) -> bool:
+# ---------- SMTP (Zoho) ----------
+def send_email_via_zoho(subject: str, body: str) -> bool:
     sender   = (os.environ.get("ZOHO_EMAIL") or "").strip()
     app_pass = (os.environ.get("ZOHO_APP_PASSWORD") or "").strip()
     to_addr  = (os.environ.get("ZOHO_TO_EMAIL") or sender).strip() or sender
     host     = (os.environ.get("ZOHO_SMTP_HOST") or "smtp.zoho.in").strip()
     port     = int(os.environ.get("ZOHO_SMTP_PORT") or "465")
 
-    if not sender or not app_pass or not to_addr:
-        app.logger.warning("[SMTP] Missing env vars; skip send")
+    if not sender or not app_pass:
+        # Don’t fail the request if mail isn’t configured
+        app.logger.warning("ZOHO_EMAIL/ZOHO_APP_PASSWORD missing; skipping SMTP")
         return False
 
-    msg = MIMEMultipart()
+    msg = MIMEText(body, _charset="utf-8")
     msg["Subject"] = subject
-    msg["From"]    = sender
-    msg["To"]      = to_addr
-    if reply_to:
-        msg["Reply-To"] = reply_to
-    msg.attach(MIMEText(body, _charset="utf-8"))
-
-    for att in (attachments or []):
-        try:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(base64.b64decode(att.get("b64","")))
-            encoders.encode_base64(part)
-            fname = att.get("filename","attachment")
-            ctype = att.get("content_type","application/octet-stream")
-            part.add_header("Content-Disposition", f'attachment; filename="{fname}"')
-            part.add_header("Content-Type", ctype)
-            msg.attach(part)
-        except Exception as e:
-            app.logger.error(f"[SMTP attach] {e}")
+    msg["From"] = sender
+    msg["To"] = to_addr
 
     try:
         ctx = ssl.create_default_context()
-        with smtplib.SMTP_SSL(host, port, context=ctx, timeout=12) as s:
+        with smtplib.SMTP_SSL(host, port, context=ctx, timeout=25) as s:
             s.login(sender, app_pass)
             s.send_message(msg)
         return True
     except Exception as e:
-        app.logger.error(f"[SMTP send] {e}")
+        app.logger.error("SMTP failed: %s", e)
         return False
 
-def _send_email_background(subject, body, reply_to="", attachments=None):
-    threading.Thread(target=_send_email_sync, args=(subject, body, reply_to, attachments), daemon=True).start()
-# ---------------------------------------
+# ---------- Helpers ----------
+def ok_response(data=None, code=200):
+    payload = {"ok": True, **(data or {})}
+    return jsonify(payload), code
+
+def err_response(msg, code=400):
+    return jsonify({"ok": False, "error": str(msg)}), code
 
 # ---------- Routes ----------
 @app.get("/api/health")
 def health():
-    try:
-        return jsonify({
-            "ok": True,
-            "ts": datetime.utcnow().isoformat(timespec="seconds")+"Z",
-            "data_dir": DATA_DIR,
-            "db_exists": os.path.exists(DB_PATH),
-            "csv_exists": os.path.exists(CSV_PATH),
-            "allowed_origins": ALLOWED,
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    return ok_response({"status":"up", "ver": APP_VER})
 
 @app.post("/api/contact")
 def contact():
-    _init_db()
-    try:
-        data = request.get_json(silent=True) or {}
-        name = (data.get("name") or "").strip()
-        email = (data.get("email") or "").strip()
-        message = (data.get("message") or "").strip()
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip()
+    message = (data.get("message") or "").strip()
 
-        if not name or not EMAIL_REGEX.match(email) or not message:
-            return jsonify({"ok": False, "error": "Invalid input"}), 400
-        if len(name) > 120 or len(email) > 200 or len(message) > 8000:
-            return jsonify({"ok": False, "error": "Input too long"}), 413
+    if not name or not EMAIL_REGEX.match(email) or not message:
+        return err_response("Invalid input", 400)
 
-        lead_id, created_at = _save_lead("contact", name, email, message)
-        subject = f"New website inquiry from {name}"
-        body    = f"Topic: CONTACT\nName: {name}\nEmail: {email}\n\n{message}\n(Lead #{lead_id} at {created_at})"
-        _send_email_background(subject, body, reply_to=email)
+    lead_id, created_at = save_lead(
+        topic="contact", name=name, email=email, message=message,
+        phone="", company="", sanctioned_load="", monthly_kwh=""
+    )
 
-        return jsonify({"ok": True, "id": lead_id, "created_at": created_at, "email_queued": True})
-    except Exception as e:
-        app.logger.error(f"[contact] {e}")
-        return jsonify({"ok": False, "error": "server_error"}), 500
+    body = f"New Contact Lead\n\nName: {name}\nEmail: {email}\n\nMessage:\n{message}\n\nID:{lead_id}  Time:{created_at}"
+    sent = send_email_via_zoho(subject=f"Contact from {name}", body=body)
 
-@app.post("/api/openaccess")
-def openaccess():
-    """
-    Expected JSON:
-    {
-      "name": "Acme Ltd / John",
-      "email": "x@y.z",
-      "phone": "+91...",
-      "sanctioned_load": "1000",     # kVA (string or number)
-      "monthly_kwh": "350000",       # kWh (string or number)
-      "callback": true,              # optional bool
-      "eb_bill": {                   # optional file
-        "filename": "bill.pdf",
-        "content_type": "application/pdf",
-        "b64": "<base64 data>"
-      }
-    }
-    """
-    _init_db()
-    try:
-        data = request.get_json(silent=True) or {}
-        name  = (data.get("name")  or "").strip()
-        email = (data.get("email") or "").strip()
-        phone = (data.get("phone") or "").strip()
-        sanctioned = str(data.get("sanctioned_load") or "").strip()
-        monthly   = str(data.get("monthly_kwh")   or "").strip()
-        callback  = bool(data.get("callback"))
-        eb_bill   = data.get("eb_bill")
+    # IMPORTANT: even if email fails, still return ok so the UI doesn’t scare users
+    return ok_response({"id": lead_id, "created_at": created_at, "email_sent": bool(sent)})
 
-        if not name or not EMAIL_REGEX.match(email) or not sanctioned or not monthly:
-            return jsonify({"ok": False, "error": "Invalid input"}), 400
+@app.post("/api/oa-inquiry")
+def oa_inquiry():
+    data = request.get_json(silent=True) or {}
+    name  = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip()
+    company = (data.get("company") or "").strip()
+    phone   = (data.get("phone") or "").strip()
+    sanctioned_load = (data.get("sanctioned_load") or "").strip()
+    monthly_kwh     = (data.get("monthly_kwh") or "").strip()
 
-        msg = (f"[Open Access Inquiry]\nPhone: {phone}\n"
-               f"Sanctioned Load (kVA): {sanctioned}\nMonthly (kWh): {monthly}\n"
-               f"Callback: {'Yes' if callback else 'No'}")
-        lead_id, created_at = _save_lead("openaccess", name, email, msg)
+    if not name or not company or not EMAIL_REGEX.match(email):
+        return err_response("Invalid input", 400)
 
-        subject = "Open Access Inquiry"
-        body    = (f"Topic: OPEN ACCESS\nName: {name}\nEmail: {email}\nPhone: {phone}\n"
-                   f"Sanctioned Load (kVA): {sanctioned}\nMonthly Consumption (kWh): {monthly}\n"
-                   f"Callback: {'Yes' if callback else 'No'}\n\n(Lead #{lead_id} at {created_at})")
-        attachments = [eb_bill] if isinstance(eb_bill, dict) and eb_bill.get("b64") else []
-        _send_email_background(subject, body, reply_to=email, attachments=attachments)
+    lead_id, created_at = save_lead(
+        topic="open-access", name=name, email=email, phone=phone, company=company,
+        sanctioned_load=sanctioned_load, monthly_kwh=monthly_kwh, message=""
+    )
 
-        return jsonify({"ok": True, "id": lead_id, "created_at": created_at, "email_queued": True})
-    except Exception as e:
-        app.logger.error(f"[openaccess] {e}")
-        return jsonify({"ok": False, "error": "server_error"}), 500
-# ---------------------------
+    # Email summary (skip large attachments on free tier)
+    lines = [
+        "Open Access Inquiry",
+        f"Name: {name}",
+        f"Company: {company}",
+        f"Email: {email}",
+        f"Phone: {phone}",
+        f"Sanctioned Load: {sanctioned_load}",
+        f"Monthly kWh: {monthly_kwh}",
+        f"ID:{lead_id}  Time:{created_at}"
+    ]
+    sent = send_email_via_zoho(subject=f"OA Inquiry — {company} ({name})",
+                               body="\n".join(lines))
 
-# Init on import (for all gunicorn workers)
-def _maybe_init():
-    _init_db()
-_maybe_init()
+    return ok_response({"id": lead_id, "created_at": created_at, "email_sent": bool(sent)})
+
+# ---------- Always JSON for errors on /api ----------
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith("/api/"):
+        return err_response("Not found", 404)
+    return e, 404
+
+@app.errorhandler(500)
+def server_error(e):
+    app.logger.exception("Unhandled 500: %s", e)
+    if request.path.startswith("/api/"):
+        return err_response("Server error", 500)
+    return e, 500
+
+# ---------- Startup ----------
+init_db()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")), debug=True)
